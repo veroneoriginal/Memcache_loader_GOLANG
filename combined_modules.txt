@@ -1,0 +1,402 @@
+Вот структура проекта:
+
+./
+├── appsinstalled.proto
+├── config.go
+├── go.mod
+├── main.go
+├── parser.go
+├── processor.go
+└── writer.go
+
+Можешь искать нужные файлы в проекте в этом документе, схема выше.
+
+======================
+
+# appsinstalled.proto
+syntax = "proto2";
+
+message UserApps {
+  repeated uint32 apps = 1;
+  optional double lat = 2;
+  optional double lon = 3;
+}
+
+======================
+
+# config.go
+// константы (= config.py)
+package main
+
+// Константы и настройки загрузчика.
+const (
+	normalErrRate = 0.01
+	batchSize     = 500
+	chanBuffer    = 5000
+)
+
+======================
+
+# go.mod
+module memc_loader
+
+go 1.21
+
+require (
+github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874
+google.golang.org/protobuf v1.34.0
+)
+
+======================
+
+# main.go
+// точка входа, флаги, оркестрация (= memc_load.py)
+// memc_loader — конкурентный загрузчик логов трекера мобильных приложений в memcache.
+//
+// Архитектура (Go-версия):
+//   - Главная горутина читает .tsv.gz файлы и парсит строки
+//   - На каждый тип устройства запускается горутина-писатель (writer.go)
+//   - Данные передаются через каналы (вместо Python-очередей)
+//   - Несколько файлов обрабатываются параллельно через sync.WaitGroup
+package main
+
+import (
+	"flag"
+	"log"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+func dotRename(path string) {
+	dir, fn := filepath.Split(path)
+	newPath := filepath.Join(dir, "."+fn)
+	if err := os.Rename(path, newPath); err != nil {
+		log.Printf("Ошибка переименования %s: %v", path, err)
+	}
+}
+
+func main() {
+	pattern := flag.String("pattern", "/data/appsinstalled/*.tsv.gz", "Паттерн файлов")
+	logFile := flag.String("log", "", "Файл логов (по умолчанию stdout)")
+	dryRun  := flag.Bool("dry", false, "Dry-run: логировать без записи")
+	workers := flag.Int("workers", 4, "Количество параллельных файлов")
+	idfa    := flag.String("idfa", "127.0.0.1:33013", "Адрес memcache для idfa")
+	gaid    := flag.String("gaid", "127.0.0.1:33014", "Адрес memcache для gaid")
+	adid    := flag.String("adid", "127.0.0.1:33015", "Адрес memcache для adid")
+	dvid    := flag.String("dvid", "127.0.0.1:33016", "Адрес memcache для dvid")
+	flag.Parse()
+
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("Не удалось открыть файл логов: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
+
+	deviceMemc := map[string]string{
+		"idfa": *idfa,
+		"gaid": *gaid,
+		"adid": *adid,
+		"dvid": *dvid,
+	}
+
+	files, err := filepath.Glob(*pattern)
+	if err != nil || len(files) == 0 {
+		log.Println("Нет файлов для обработки")
+		return
+	}
+	log.Printf("Найдено файлов: %d", len(files))
+
+	// fileResult хранит итог обработки одного файла
+	type fileResult struct {
+		fn        string
+		processed int
+		errors    int
+	}
+
+	// семафор ограничивает число параллельных горутин (аналог multiprocessing.Pool)
+	sem := make(chan struct{}, *workers)
+	var wg sync.WaitGroup
+
+	var mu sync.Mutex
+	var allResults []fileResult
+
+	for _, fn := range files {
+		fn := fn
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			log.Printf("Обработка: %s", fn)
+			processed, errors := processFile(fn, deviceMemc, *dryRun)
+
+			mu.Lock()
+			allResults = append(allResults, fileResult{fn, processed, errors})
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	// переименовываем файлы после завершения всех горутин
+	for _, r := range allResults {
+		if r.processed == 0 {
+			dotRename(r.fn)
+			continue
+		}
+		errRate := float64(r.errors) / float64(r.processed)
+		if errRate < normalErrRate {
+			log.Printf("Приемлемая доля ошибок (%.4f). Успешная загрузка: %s", errRate, r.fn)
+		} else {
+			log.Printf("Высокая доля ошибок (%.4f > %.2f). Неудачная загрузка: %s",
+				errRate, normalErrRate, r.fn)
+		}
+		dotRename(r.fn)
+	}
+}
+
+======================
+
+# parser.go
+// parseLine + serialize (= parser.py)
+package main
+
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+
+	"google.golang.org/protobuf/proto"
+
+	pb "memc_loader/appsinstalled"
+)
+
+// appsInstalled — распарсенная строка из лог-файла.
+type appsInstalled struct {
+	devType string
+	devID   string
+	lat     float64
+	lon     float64
+	apps    []uint32
+}
+
+// parseLine разбирает одну TSV-строку в appsInstalled.
+// Возвращает (nil, false) если строка невалидна.
+func parseLine(line string) (*appsInstalled, bool) {
+	line = strings.TrimSpace(line)
+	parts := strings.Split(line, "\t")
+	if len(parts) < 5 {
+		return nil, false
+	}
+
+	devType, devID, rawLat, rawLon, rawApps := parts[0], parts[1], parts[2], parts[3], parts[4]
+	if devType == "" || devID == "" {
+		return nil, false
+	}
+
+	lat, err := strconv.ParseFloat(rawLat, 64)
+	if err != nil {
+		log.Printf("Некорректная широта: %s", line)
+		return nil, false
+	}
+	lon, err := strconv.ParseFloat(rawLon, 64)
+	if err != nil {
+		log.Printf("Некорректная долгота: %s", line)
+		return nil, false
+	}
+
+	var apps []uint32
+	for _, a := range strings.Split(rawApps, ",") {
+		a = strings.TrimSpace(a)
+		n, err := strconv.ParseUint(a, 10, 32)
+		if err != nil {
+			log.Printf("Пропускаем нечисловой app id %q в строке: %s", a, line)
+			continue
+		}
+		apps = append(apps, uint32(n))
+	}
+
+	return &appsInstalled{
+		devType: devType,
+		devID:   devID,
+		lat:     lat,
+		lon:     lon,
+		apps:    apps,
+	}, true
+}
+
+// serialize упаковывает appsInstalled в protobuf и возвращает (key, bytes).
+func serialize(ai *appsInstalled) (string, []byte, error) {
+	ua := &pb.UserApps{
+		Lat:  proto.Float64(ai.lat),
+		Lon:  proto.Float64(ai.lon),
+		Apps: ai.apps,
+	}
+	packed, err := proto.Marshal(ua)
+	if err != nil {
+		return "", nil, err
+	}
+	key := fmt.Sprintf("%s:%s", ai.devType, ai.devID)
+	return key, packed, nil
+}
+
+======================
+
+# processor.go
+// обработка одного файла (= processor.py)
+package main
+
+import (
+	"bufio"
+	"compress/gzip"
+	"log"
+	"os"
+)
+
+// processFile читает один .tsv.gz файл и раздаёт записи горутинам-писателям.
+// Возвращает суммарное количество обработанных записей и ошибок.
+func processFile(fn string, deviceMemc map[string]string, dryRun bool) (processed, errors int) {
+	// создаём канал и запускаем горутину-писатель для каждого типа устройства
+	channels := make(map[string]chan record)
+	resultCh := make(chan result, len(deviceMemc))
+
+	for devType, addr := range deviceMemc {
+		ch := make(chan record, chanBuffer)
+		channels[devType] = ch
+		go writer(addr, ch, resultCh, dryRun)
+	}
+
+	// читаем файл и раскидываем по каналам
+	parseErrors := 0
+
+	f, err := os.Open(fn)
+	if err != nil {
+		log.Printf("Ошибка открытия файла %s: %v", fn, err)
+	} else {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			log.Printf("Ошибка чтения gzip %s: %v", fn, err)
+		} else {
+			scanner := bufio.NewScanner(gz)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					continue
+				}
+				ai, ok := parseLine(line)
+				if !ok {
+					parseErrors++
+					continue
+				}
+				ch, ok := channels[ai.devType]
+				if !ok {
+					log.Printf("Неизвестный тип устройства: %s", ai.devType)
+					parseErrors++
+					continue
+				}
+				key, packed, err := serialize(ai)
+				if err != nil {
+					log.Printf("Ошибка сериализации: %v", err)
+					parseErrors++
+					continue
+				}
+				ch <- record{key: key, packed: packed}
+			}
+			gz.Close()
+		}
+		f.Close()
+	}
+
+	// закрываем каналы — сигнал горутинам завершить работу
+	for _, ch := range channels {
+		close(ch)
+	}
+
+	// собираем результаты от всех горутин-писателей
+	for range deviceMemc {
+		r := <-resultCh
+		processed += r.processed
+		errors += r.errors
+	}
+	errors += parseErrors
+
+	return processed, errors
+}
+
+======================
+
+# writer.go
+// горутина-писатель в memcache (= writer.py)
+package main
+
+import (
+	"log"
+
+	"github.com/bradfitz/gomemcache/memcache"
+)
+
+// record — сериализованная запись, готовая к записи в memcache.
+type record struct {
+	key    string
+	packed []byte
+}
+
+// result — итог работы одной горутины-писателя.
+type result struct {
+	processed int
+	errors    int
+}
+
+// writer читает записи из канала и пишет их в memcache батчами.
+// Когда канал закрыт — дописывает остаток и отправляет итог в resultCh.
+func writer(addr string, ch <-chan record, resultCh chan<- result, dryRun bool) {
+	var processed, errors int
+
+	var mc *memcache.Client
+	if !dryRun {
+		mc = memcache.New(addr)
+	}
+
+	batch := make(map[string][]byte, batchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if dryRun {
+			processed += len(batch)
+			batch = make(map[string][]byte, batchSize)
+			return
+		}
+		for key, packed := range batch {
+			err := mc.Set(&memcache.Item{Key: key, Value: packed})
+			if err != nil {
+				log.Printf("Ошибка записи в memc %s key=%s: %v", addr, key, err)
+				errors++
+			} else {
+				processed++
+			}
+		}
+		batch = make(map[string][]byte, batchSize)
+	}
+
+	for rec := range ch {
+		if dryRun {
+			log.Printf("[dry] %s -> %s", addr, rec.key)
+		}
+		batch[rec.key] = rec.packed
+		if len(batch) >= batchSize {
+			flush()
+		}
+	}
+	flush() // дописываем остатки
+
+	resultCh <- result{processed: processed, errors: errors}
+}

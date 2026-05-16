@@ -1,0 +1,8 @@
+# appsinstalled.proto
+syntax = "proto2";
+
+message UserApps {
+  repeated uint32 apps = 1;
+  optional double lat = 2;
+  optional double lon = 3;
+}
