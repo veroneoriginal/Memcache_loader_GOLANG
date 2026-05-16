@@ -1,5 +1,3 @@
-# parser.go
-// parseLine + serialize (= parser.py)
 package main
 
 import (
@@ -10,10 +8,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "memc_loader/appsinstalled"
+	pb "memc_loader/src/appsinstalled"
 )
 
-// appsInstalled — распарсенная строка из лог-файла.
 type appsInstalled struct {
 	devType string
 	devID   string
@@ -22,20 +19,16 @@ type appsInstalled struct {
 	apps    []uint32
 }
 
-// parseLine разбирает одну TSV-строку в appsInstalled.
-// Возвращает (nil, false) если строка невалидна.
 func parseLine(line string) (*appsInstalled, bool) {
 	line = strings.TrimSpace(line)
 	parts := strings.Split(line, "\t")
 	if len(parts) < 5 {
 		return nil, false
 	}
-
 	devType, devID, rawLat, rawLon, rawApps := parts[0], parts[1], parts[2], parts[3], parts[4]
 	if devType == "" || devID == "" {
 		return nil, false
 	}
-
 	lat, err := strconv.ParseFloat(rawLat, 64)
 	if err != nil {
 		log.Printf("Некорректная широта: %s", line)
@@ -46,7 +39,6 @@ func parseLine(line string) (*appsInstalled, bool) {
 		log.Printf("Некорректная долгота: %s", line)
 		return nil, false
 	}
-
 	var apps []uint32
 	for _, a := range strings.Split(rawApps, ",") {
 		a = strings.TrimSpace(a)
@@ -57,17 +49,9 @@ func parseLine(line string) (*appsInstalled, bool) {
 		}
 		apps = append(apps, uint32(n))
 	}
-
-	return &appsInstalled{
-		devType: devType,
-		devID:   devID,
-		lat:     lat,
-		lon:     lon,
-		apps:    apps,
-	}, true
+	return &appsInstalled{devType: devType, devID: devID, lat: lat, lon: lon, apps: apps}, true
 }
 
-// serialize упаковывает appsInstalled в protobuf и возвращает (key, bytes).
 func serialize(ai *appsInstalled) (string, []byte, error) {
 	ua := &pb.UserApps{
 		Lat:  proto.Float64(ai.lat),

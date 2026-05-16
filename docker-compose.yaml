@@ -1,0 +1,39 @@
+services:
+
+  # ── Приложение
+  memc_loader:
+    build: .
+    volumes:
+      - ./data:/app/data          # папка с .tsv.gz файлами
+    depends_on:
+      - memcache_idfa
+      - memcache_gaid
+      - memcache_adid
+      - memcache_dvid
+    command: >
+      --pattern=/app/data/*.tsv.gz
+      --idfa=memcache_idfa:11211
+      --gaid=memcache_gaid:11211
+      --adid=memcache_adid:11211
+      --dvid=memcache_dvid:11211
+
+  # ── Memcache-кластер (4 инстанса, по одному на тип устройства)
+  memcache_idfa:
+    image: memcached:1.6-alpine
+    ports:
+      - "33013:11211"
+
+  memcache_gaid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33014:11211"
+
+  memcache_adid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33015:11211"
+
+  memcache_dvid:
+    image: memcached:1.6-alpine
+    ports:
+      - "33016:11211"

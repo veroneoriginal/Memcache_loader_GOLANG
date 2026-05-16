@@ -1,4 +1,3 @@
-# config.go
 // константы (= config.py)
 package main
 

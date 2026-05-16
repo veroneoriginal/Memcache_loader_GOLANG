@@ -1,4 +1,3 @@
-# writer.go
 // горутина-писатель в memcache (= writer.py)
 package main
 
